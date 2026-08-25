@@ -1,0 +1,20 @@
+[project]
+name = "pygeoapi-providers"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pygeoapi>=0.22.0",
+    "SQLAlchemy>2.0",
+    "geoalchemy2",
+    "pygeofilter",
+    "cachetools",
+    "requests>=2.32.5",
+]
+
+[build-system]
+requires = ["setuptools>=80.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+license-files = []
