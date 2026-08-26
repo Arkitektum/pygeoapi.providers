@@ -32,7 +32,7 @@ _stylesheet_types = {
     }
 }
 
-
+   
 class StyleProvider:
     def __init__(self, provider_def: Dict):
         self.styles: List[Dict[str, Any]] = provider_def['styles']

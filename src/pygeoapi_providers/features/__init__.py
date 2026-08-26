@@ -1,3 +1,4 @@
+from time import time
 import json
 from copy import deepcopy
 import logging
@@ -5,7 +6,7 @@ import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple, Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from osgeo import ogr, osr
-from sqlalchemy import Engine, text, select
+from sqlalchemy import Engine, text, select, func, Select
 from sqlalchemy.orm import Session, load_only
 from geoalchemy2 import WKBElement
 from geoalchemy2.functions import ST_Intersects, ST_MakeEnvelope, ST_Transform
@@ -44,12 +45,12 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         self.field_mappings: Dict[str, Any] = provider_def.get(
             "field_mappings", {})
-        
+
         self.has_curve_geoms: bool = provider_def.get("curve_geoms", False)
 
         self.excluded_properties: List[str] = provider_def.get(
             "exclude_properties", [])
-        
+
         self.flatten_properties: bool = provider_def.get(
             "flatten_properties", False)
 
@@ -72,7 +73,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         return fields
 
-    def get_fields(self) -> Dict:        
+    def get_fields(self) -> Dict:
         if self.schema:
             fields = json_schema_to_fields(self.schema)
 
@@ -80,7 +81,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
                 return fields
 
         fields = super().get_fields()
-        
+
         if not self.field_mappings:
             return fields
 
@@ -88,7 +89,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
             if key in fields:
                 props: Dict = fields[key]
                 props.update(value)
-        
+
         return fields
 
     def get_collection_schema(self) -> Dict | None:
@@ -151,40 +152,36 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         links_base = _determine_links_base_url(kwargs, self.links_base_url)
 
         with Session(self._engine) as session:
-            if resulttype != "hits":
-                id_column = getattr(self.table_model, self.id_field)
+            id_column = getattr(self.table_model, self.id_field)
 
+            stmt = (
+                select(id_column.label("id"))
+                .filter(property_filters)
+                .filter(cql_filters)
+                .filter(bbox_filter)
+                .filter(time_filter)
+            )
+
+            results = None
+
+            if resulttype != "hits":
                 ids_cte = (
-                    select(id_column.label("id"))
-                    .filter(property_filters)
-                    .filter(cql_filters)
-                    .filter(bbox_filter)
-                    .filter(time_filter)
+                    stmt
                     .order_by(id_column)
                     .offset(offset)
                     .limit(limit)
                     .cte("ids")
-                )                
+                )
 
                 results = (
                     session.query(self.table_model)
                     .join(ids_cte, id_column == ids_cte.c.id)
                     .options(selected_properties)
                 )
-            else:
-                results = (
-                    session.query(self.table_model)
-                    .filter(property_filters)
-                    .filter(cql_filters)
-                    .filter(bbox_filter)
-                    .filter(time_filter)
-                    .options(selected_properties)
-                )
 
             response: Dict[str, Any] = {"type": "FeatureCollection"}
-
             response["features"] = []
-            response["numberMatched"] = results.count()
+            response["numberMatched"] = self._get_count(stmt, session)
             response["numberReturned"] = 0
 
             if resulttype == "hits" or not results:
@@ -307,7 +304,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         for key in keys:
             if key in item_dict:
-                properties[key] = item_dict[key]        
+                properties[key] = item_dict[key]
 
         if self.flatten_properties:
             feature["properties"] = self._flatten_properties(properties)
@@ -317,6 +314,17 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         self._add_provider_links(feature, feature_id, links_base)
 
         return feature
+
+    def _get_count(self, stmt: Select, session: Session) -> int | None:
+        count_stmt = (
+            stmt.with_only_columns(
+                func.count(), maintain_column_froms=True)
+            .order_by(None)
+            .limit(None)
+            .offset(None)
+        )
+
+        return session.scalar(count_stmt)           
 
     def _get_bbox_filter(self, bbox: List[float]):
         if not bbox:
