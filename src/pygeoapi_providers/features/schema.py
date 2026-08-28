@@ -1,25 +1,32 @@
 import copy
 import json
 import logging
+from collections import Counter
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, NamedTuple, Tuple
 import requests
 from .uri_type import UriType
 
 _logger = logging.getLogger(__name__)
 
 _GEOM_FORMATS = {
-    'point': 'geometry-point',
-    'multipoint': 'geometry-multipoint',
-    'linestring': 'geometry-linestring',
-    'multilinestring': 'geometry-multilinestring',
-    'polygon': 'geometry-polygon',
-    'multipolygon': 'geometry-multipolygon',
-    'geometrycollection': 'geometry-geometrycollection',
-    'geometry': 'geometry-any'
+    "point": "geometry-point",
+    "multipoint": "geometry-multipoint",
+    "linestring": "geometry-linestring",
+    "multilinestring": "geometry-multilinestring",
+    "polygon": "geometry-polygon",
+    "multipolygon": "geometry-multipolygon",
+    "geometrycollection": "geometry-geometrycollection",
+    "geometry": "geometry-any"
 }
+
+
+class Leaf(NamedTuple):
+    path: Tuple[str, ...]
+    subschema: Any
+    required: bool
 
 
 def json_schema_to_fields(
@@ -36,39 +43,39 @@ def json_schema_to_fields(
 def _create_fields(schema: Dict[str, Any]) -> Dict[str, Any]:
     fields = {}
 
-    def walk(props: Dict[str, Any], prefix: str = ''):
+    def walk(props: Dict[str, Any], prefix: str = ""):
         for name, defn in props.items():
             if not isinstance(defn, dict):
                 continue
 
-            key = f'{prefix}.{name}' if prefix else name
+            key = f"{prefix}.{name}" if prefix else name
 
-            if _is_geometry(defn) or '$ref' in defn:
+            if _is_geometry(defn) or "$ref" in defn:
                 continue
 
-            if defn.get('type') == 'object' and 'properties' in defn:
-                walk(defn['properties'], key)
+            if defn.get("type") == "object" and "properties" in defn:
+                walk(defn["properties"], key)
                 continue
 
-            items = defn.get('items', {})
-            if (defn.get('type') == 'array'
+            items = defn.get("items", {})
+            if (defn.get("type") == "array"
                     and isinstance(items, dict)
-                    and items.get('type') == 'object'
-                    and 'properties' in items):
-                walk(items['properties'], key)
+                    and items.get("type") == "object"
+                    and "properties" in items):
+                walk(items["properties"], key)
                 continue
 
             field = copy.deepcopy(defn)
 
-            if isinstance(field.get('type'), list):
-                field['type'] = next(
-                    (t for t in field['type'] if t != 'null'), 'string')
+            if isinstance(field.get("type"), list):
+                field["type"] = next(
+                    (t for t in field["type"] if t != "null"), "string")
 
-            field.setdefault('type', 'string')
+            field.setdefault("type", "string")
 
             fields[key] = field
 
-    walk(schema.get('properties', schema))
+    walk(schema.get("properties", schema))
     return fields
 
 
@@ -76,14 +83,23 @@ def json_schema_to_collection_schema(
     schema_uri: str,
     id_field: str,
     time_field: str | None,
-    geometry_field: str | None = 'geometry'
+    geometry_field: str | None = "geometry",
+    flatten: bool = False
 ) -> Dict[str, Any] | None:
     schema = _load_jsonschema(schema_uri)
 
-    if schema:
-        return _create_collection_schema(schema, id_field, time_field, geometry_field)
+    if not schema:
+        return None
 
-    return None
+    collection_schema = _create_collection_schema(
+        schema, id_field, time_field, geometry_field)
+
+    if not flatten:
+        return collection_schema
+
+    flattened, _ = _flatten_schema(collection_schema)
+
+    return flattened
 
 
 def _create_collection_schema(
@@ -95,28 +111,28 @@ def _create_collection_schema(
     schema = copy.deepcopy(schema)
 
     def _traverse(node: Dict[str, Any]):
-        properties: Dict[str, Dict[str, Any]] = node.get('properties', {})
+        properties: Dict[str, Dict[str, Any]] = node.get("properties", {})
 
         for key, prop_schema in properties.items():
             if id_field and key == id_field:
-                prop_schema['x-ogc-role'] = 'id'
+                prop_schema["x-ogc-role"] = "id"
 
             elif time_field and key == time_field:
-                prop_schema['x-ogc-role'] = 'primary-instant'
+                prop_schema["x-ogc-role"] = "primary-instant"
 
             elif geometry_field and key == geometry_field:
-                ref: str | None = prop_schema.pop('$ref', None)
-                fmt = 'geometry-any'
+                ref: str | None = prop_schema.pop("$ref", None)
+                fmt = "geometry-any"
 
                 if ref:
-                    geom_type = ref.rstrip('/').rsplit('/', 1)[-1]
-                    geom_type = geom_type.removesuffix('.json').lower()
-                    fmt = _GEOM_FORMATS.get(geom_type, 'geometry-any')
+                    geom_type = ref.rstrip("/").rsplit("/", 1)[-1]
+                    geom_type = geom_type.removesuffix(".json").lower()
+                    fmt = _GEOM_FORMATS.get(geom_type, "geometry-any")
 
-                prop_schema['x-ogc-role'] = 'primary-geometry'
-                prop_schema['format'] = fmt
+                prop_schema["x-ogc-role"] = "primary-geometry"
+                prop_schema["format"] = fmt
 
-            if 'properties' in prop_schema:
+            if "properties" in prop_schema:
                 _traverse(prop_schema)
 
     _traverse(schema)
@@ -124,17 +140,109 @@ def _create_collection_schema(
     return schema
 
 
+def _flatten_schema(
+    schema: Dict[str, Any],
+    separator: str = "_"
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    if not is_flattenable(schema):
+        raise ValueError(
+            "Top-level schema must be an object with a 'properties' map")
+
+    leaves = _collect_leaves(schema["properties"], schema.get("required", []))
+    names = _assign_names(leaves, separator=separator)
+
+    flat_properties: Dict[str, Any] = {}
+    flat_required: List[str] = []
+    mapping: Dict[str, str] = {}
+
+    for leaf in leaves:
+        name = names[leaf.path]
+        flat_properties[name] = copy.deepcopy(leaf.subschema)
+        mapping[name] = ".".join(leaf.path)
+        if leaf.required:
+            flat_required.append(name)
+
+    result = {k: v for k, v in schema.items(
+    ) if k not in ("properties", "required")}
+    result["properties"] = flat_properties
+    if flat_required:
+        result["required"] = flat_required
+    if "additionalProperties" in schema:
+        result["additionalProperties"] = schema["additionalProperties"]
+
+    return result, mapping
+
+
+def _collect_leaves(
+    properties: Dict[str, Any],
+    required: List[str] | None = None,
+    _path: Tuple[str, ...] = (),
+    _parent_required: bool = True
+) -> List[Leaf]:
+    required = required or []
+    leaves: List[Leaf] = []
+
+    for name, subschema in properties.items():
+        path = _path + (name,)
+        is_required = _parent_required and name in required
+
+        if is_flattenable(subschema):
+            leaves.extend(
+                _collect_leaves(
+                    subschema["properties"],
+                    subschema.get("required", []),
+                    _path=path,
+                    _parent_required=is_required,
+                )
+            )
+        else:
+            leaves.append(Leaf(path, subschema, is_required))
+
+    return leaves
+
+
+def _assign_names(
+    leaves: List[Leaf],
+    separator: str = "_"
+) -> Dict[Tuple[str, ...], str]:
+    counts = Counter(leaf.path[-1] for leaf in leaves)
+    names: Dict[Tuple[str, ...], str] = {}
+    used: Dict[str, int] = {}
+
+    for leaf in leaves:
+        leaf_name = leaf.path[-1]
+        name = leaf_name if counts[leaf_name] == 1 else separator.join(
+            leaf.path)
+
+        if name in used:
+            used[name] += 1
+            name = f"{name}{separator}{used[name]}"
+        used.setdefault(name, 1)
+
+        names[leaf.path] = name
+
+    return names
+
+
 def _is_geometry(defn: Dict[str, Any]) -> bool:
-    ref: str = defn.get('$ref', '')
+    ref: str = defn.get("$ref", "")
 
     if ref:
-        basename = ref.rstrip('/').rsplit('/', 1)[-1].removesuffix('.json')
+        basename = ref.rstrip("/").rsplit("/", 1)[-1].removesuffix(".json")
         return basename.lower() in {
-            'point', 'multipoint', 'linestring', 'multilinestring',
-            'polygon', 'multipolygon', 'geometrycollection', 'geometry'}
+            "point", "multipoint", "linestring", "multilinestring",
+            "polygon", "multipolygon", "geometrycollection", "geometry"}
 
-    return (defn.get('x-ogc-role') == 'primary-geometry'
-            or str(defn.get('format', '')).startswith('geometry'))
+    return (defn.get("x-ogc-role") == "primary-geometry"
+            or str(defn.get("format", "")).startswith("geometry"))
+
+
+def is_flattenable(subschema: Any) -> bool:
+    return (
+        isinstance(subschema, dict)
+        and subschema.get("type") == "object"
+        and isinstance(subschema.get("properties"), dict)
+    )
 
 
 def _load_jsonschema(schema_uri: str) -> Dict[str, Any] | None:
@@ -158,7 +266,7 @@ def _get_schema_from_path(schema_uri: str) -> str | None:
     if not path.exists():
         return None
 
-    with open(path, 'r') as file:
+    with open(path, "r") as file:
         return file.read()
 
 
@@ -169,20 +277,20 @@ def _get_schema_from_http(url: str) -> str | None:
 
         return response.text
     except Exception as err:
-        _logger.warning(f'Could not JSON schema: {url}', err)
+        _logger.warning(f"Could not JSON schema: {url}", err)
         return None
 
 
 def _get_uri_type(uri: str) -> UriType:
     parsed = urlparse(uri)
 
-    if parsed.scheme in ('http', 'https'):
+    if parsed.scheme in ("http", "https"):
         return UriType.HTTP_URL
 
-    if parsed.scheme == 'file':
+    if parsed.scheme == "file":
         return UriType.FILE_URL
 
     return UriType.PATH
 
 
-__all__ = ['json_schema_to_collection_schema', 'json_schema_to_fields']
+__all__ = ["json_schema_to_collection_schema", "json_schema_to_fields"]

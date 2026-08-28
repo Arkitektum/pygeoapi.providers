@@ -1,17 +1,15 @@
-from time import time
 import json
 from copy import deepcopy
 import logging
-import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple, Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from osgeo import ogr, osr
-from sqlalchemy import Engine, text, select, func, Select
+from sqlalchemy import select, func, Select
 from sqlalchemy.orm import Session, load_only
 from geoalchemy2 import WKBElement
 from geoalchemy2.functions import ST_Intersects, ST_MakeEnvelope, ST_Transform
 from cachetools import cached, TTLCache, keys
-import requests
+from functools import cached_property
 from pygeoapi.provider.base import ProviderItemNotFoundError
 from pygeoapi.provider.sql import PostgreSQLProvider as PostgreSQLProviderBase
 from pygeoapi.crs import CrsTransformSpec, get_crs, transform_bbox, DEFAULT_STORAGE_CRS
@@ -41,12 +39,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         self.storage_crs_uri: str = provider_def.get(
             "storage_crs", DEFAULT_STORAGE_CRS)
 
-        self.schema: str | None = provider_def.get('schema')
-
-        self.field_mappings: Dict[str, Any] = provider_def.get(
-            "field_mappings", {})
-
-        self.has_curve_geoms: bool = provider_def.get("curve_geoms", False)
+        self.schema: str | None = provider_def.get("schema")
 
         self.excluded_properties: List[str] = provider_def.get(
             "exclude_properties", [])
@@ -74,27 +67,12 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         return fields
 
     def get_fields(self) -> Dict:
-        if self.schema:
-            fields = json_schema_to_fields(self.schema)
-
-            if fields:
-                return fields
-
-        fields = super().get_fields()
-
-        if not self.field_mappings:
-            return fields
-
-        for key, value in self.field_mappings.items():
-            if key in fields:
-                props: Dict = fields[key]
-                props.update(value)
-
-        return fields
+        return self._get_cached_fields
 
     def get_collection_schema(self) -> Dict | None:
         if self.schema:
-            return json_schema_to_collection_schema(self.schema, self.id_field, self.time_field)
+            return json_schema_to_collection_schema(
+                self.schema, self.id_field, self.time_field, flatten=self.flatten_properties)
 
         return None
 
@@ -265,6 +243,16 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         return feature
 
+    @cached_property
+    def _get_cached_fields(self) -> Dict:
+        if self.schema:
+            fields = json_schema_to_fields(self.schema)
+
+            if fields:
+                return fields
+
+        return super().get_fields()
+
     def _create_feature(
         self,
         item: Any,
@@ -280,7 +268,13 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         if item_dict.get(self.geom):
             ewkb_elem: WKBElement = item_dict.pop(self.geom)
-            geom = self._get_geometry(ewkb_elem)
+            wkb_data = ewkb_elem.as_wkb().data
+            raw_geom: ogr.Geometry = ogr.CreateGeometryFromWkb(wkb_data)
+
+            if raw_geom.HasCurveGeometry():
+                geom = raw_geom.GetLinearGeometry()
+            else:
+                geom = raw_geom
 
             if coord_trans:
                 geom.Transform(coord_trans)
@@ -299,7 +293,6 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         feature["id"] = feature_id
         properties = {}
 
-        # self._add_mapped_values(item_dict)
         keys = self._get_properties(select_properties)
 
         for key in keys:
@@ -324,7 +317,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
             .offset(None)
         )
 
-        return session.scalar(count_stmt)           
+        return session.scalar(count_stmt)
 
     def _get_bbox_filter(self, bbox: List[float]):
         if not bbox:
@@ -340,12 +333,6 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         return bbox_filter
 
-    def _get_geometry(self, ewkb_elem: WKBElement) -> ogr.Geometry:
-        wkb_elem = ewkb_elem.as_wkb()
-        geom: ogr.Geometry = ogr.CreateGeometryFromWkb(wkb_elem.data)
-
-        return geom if not self.has_curve_geoms else geom.GetLinearGeometry()
-
     def _get_properties(self, select_properties: List[str]) -> List[str]:
         keys = self._expand_property_prefixes(
             select_properties) or self.get_fields().keys()
@@ -358,6 +345,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         E.g. ["arealplanId"] -> ["arealplanId.kommunenummer", "arealplanId.planidentifikasjon", ...]
         """
+        print(names)
         if not names:
             return names
 
@@ -475,19 +463,6 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         feature["prev"] = prev
         feature["next"] = next
 
-    # def _add_mapped_values(self, item_dict: Dict) -> None:
-    #     if not self.field_mapping_data:
-    #         return
-
-    #     for key, data in self.field_mapping_data.items():
-    #         if not key in item_dict:
-    #             continue
-
-    #         value = item_dict[key]
-    #         mapped_value = next(
-    #             (tup for tup in data if tup[0] == str(value)), None)
-    #         item_dict[key] = mapped_value[1] if mapped_value else value
-
     def _add_provider_links(
         self, feature: Dict[str, Any], feature_id: Any, links_base: str | None
     ) -> None:
@@ -511,9 +486,6 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         if link_candidates:
             _merge_links(feature, link_candidates, links_base)
-
-    def _get_collection_namespace(self) -> str:
-        return f"{self.db_name}.{self.db_search_path[0]}.{self.table}"
 
 
 def _get_coordinate_transformation(
@@ -887,105 +859,3 @@ def _normalize_link_config(link_definition: Any) -> List[Dict[str, Any]]:
                 templates.append(deepcopy(item))
 
     return templates
-
-
-@cached(
-    cache=_sessions_cache,
-    key=lambda field_mappings, namespace, engine, db_search_path: keys.hashkey(
-        namespace
-    ),
-)
-def _get_field_mapping_data(
-    field_mappings: Dict[str, Dict[str, str]],
-    namespace: str,
-    engine: Engine,
-    db_search_path: str,
-) -> Dict[str, List[Tuple]]:
-    mapping_data: Dict[str, List[Tuple]] = {}
-
-    if not field_mappings:
-        return mapping_data
-
-    codelist_mappings = [
-        item for item in field_mappings.items() if "codelist" in item[1]
-    ]
-
-    if codelist_mappings:
-        codelist_mapping_data = _create_field_mapping_data_from_codelists(
-            codelist_mappings
-        )
-        mapping_data.update(codelist_mapping_data)
-
-    table_mappings = [item for item in field_mappings.items()
-                      if "table" in item[1]]
-
-    if table_mappings:
-        table_mapping_data = _create_field_mapping_data_from_tables(
-            engine, db_search_path, table_mappings
-        )
-        mapping_data.update(table_mapping_data)
-
-    return mapping_data
-
-
-def _create_field_mapping_data_from_tables(
-    engine: Engine, db_search_path: str, table_mappings: List[Tuple[str, Dict]]
-) -> Dict[str, List[Tuple]]:
-    mapping_data: Dict[str, List[Tuple]] = {}
-
-    with engine.connect() as connection:
-        for key, value in table_mappings:
-            try:
-                sql = f"SELECT {value.get('id_field')}, {value.get('value_field')} FROM {db_search_path}.{value.get('table')}"
-                result = connection.execute(text(sql))
-                rows = result.fetchall()
-                values = [tuple(row) for row in rows]
-                mapping_data[key] = values
-            except Exception as err:
-                _logger.warning(
-                    f"Could not create mapping data from table {value.get('table')}: {err}"
-                )
-
-    return mapping_data
-
-
-def _create_field_mapping_data_from_codelists(
-    codelist_mappings: List[Tuple[str, Dict[str, str]]],
-) -> Dict[str, List[Tuple]]:
-    mapping_data: Dict[str, List[Tuple]] = {}
-
-    for key, value in codelist_mappings:
-        url = value.get("codelist")
-
-        if not url:
-            continue
-
-        try:
-            mapping_data[key] = _get_codelist(url)
-        except Exception as err:
-            _logger.warning(
-                f"Could not create mapping data from codelist {url}: {err}")
-
-    return mapping_data
-
-
-def _get_codelist(url: str) -> List[Tuple[str, str]]:
-    response = requests.get(url)
-    response.raise_for_status()
-
-    root = ET.fromstring(response.text)
-    ns = {"gml": "http://www.opengis.net/gml/3.2"}
-    codelist: List[Tuple[str, str]] = []
-
-    for definition in root.findall("gml:dictionaryEntry/gml:Definition", ns):
-        id = definition.findtext("gml:identifier", namespaces=ns)
-        name = definition.findtext("gml:name", namespaces=ns)
-
-        if not id or not name:
-            continue
-
-        codelist.append((id.strip(), name.strip()))
-
-    codelist.sort(key=lambda entry: entry[0])
-
-    return codelist

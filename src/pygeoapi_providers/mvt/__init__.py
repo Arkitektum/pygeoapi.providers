@@ -146,9 +146,6 @@ class MVTPostgreSQLProvider(MVTPostgreSQLProviderBase):
     def _get_cache_key(self) -> str:
         return f"{self.db_name}/{self.db_search_path[0]}/{self.table}"
 
-    def __repr__(self):
-        return f"<MVTPostgreSQLProvider> {self.data}"
-
 
 @cached(
     cache=_mvt_cache,
