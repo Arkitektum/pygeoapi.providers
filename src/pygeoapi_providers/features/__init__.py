@@ -4,13 +4,16 @@ import logging
 from typing import Dict, List, Tuple, Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from osgeo import ogr, osr
-from sqlalchemy import select, func, Select
-from sqlalchemy.orm import Session, load_only
+from sqlalchemy import select, func, Select, case
+from sqlalchemy.orm import Session, class_mapper, column_property, load_only
 from geoalchemy2 import WKBElement
 from geoalchemy2.functions import ST_Intersects, ST_MakeEnvelope, ST_Transform
 from cachetools import cached, TTLCache, keys
 from functools import cached_property
-from pygeoapi.provider.base import ProviderItemNotFoundError
+from pygeoapi.provider.base import (
+    ProviderInvalidQueryError,
+    ProviderItemNotFoundError
+)
 from pygeoapi.provider.sql import PostgreSQLProvider as PostgreSQLProviderBase
 from pygeoapi.crs import CrsTransformSpec, get_crs, transform_bbox, DEFAULT_STORAGE_CRS
 from .schema import json_schema_to_fields, json_schema_to_collection_schema
@@ -21,7 +24,21 @@ osr.UseExceptions()
 _sessions_cache = TTLCache(maxsize=640 * 1024, ttl=86400)
 
 _logger = logging.getLogger(__name__)
+
 DEFAULT_CRS = "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+
+PROPERTY_SHAPE_NESTED = "nested"
+PROPERTY_SHAPE_FLAT_LEAF = "flat_leaf"
+PROPERTY_SHAPE_DOTTED = "dotted"
+
+PROPERTY_SHAPES = (
+    PROPERTY_SHAPE_NESTED,
+    PROPERTY_SHAPE_FLAT_LEAF,
+    PROPERTY_SHAPE_DOTTED,
+)
+
+GEOMETRY_GML_KEY = "_geometry_gml"
+DERIVED_POINT_GML_KEY = "_derived_point_gml"
 
 
 class PostgreSQLProvider(PostgreSQLProviderBase):
@@ -44,10 +61,39 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         self.excluded_properties: List[str] = provider_def.get(
             "exclude_properties", [])
 
+        self.property_shape: str = _resolve_property_shape(provider_def)
+
         self.flatten_properties: bool = provider_def.get(
             "flatten_properties", False)
 
+        self.gml_passthrough: bool = provider_def.get("gml_passthrough", False)
+        self.derived_point_passthrough: bool = provider_def.get(
+            "derived_point_passthrough", False
+        )
+        self.gml_options: int = provider_def.get("gml_options", 1)
+        self.gml_precision: int = provider_def.get("gml_precision", 15)
+        self.gml_unwrap_multi: bool = provider_def.get(
+            "gml_unwrap_multi", True)
+
+        if self.derived_point_passthrough and not self.gml_passthrough:
+            _logger.warning(
+                "derived_point_passthrough requires gml_passthrough; ignoring."
+            )
+
+        synthetic_keys: List[str] = []
+
+        if self.gml_passthrough:
+            synthetic_keys.append(GEOMETRY_GML_KEY)
+
+            if self.derived_point_passthrough:
+                synthetic_keys.append(DERIVED_POINT_GML_KEY)
+
+        self._synthetic_keys: Tuple[str, ...] = tuple(synthetic_keys)
+
         super().__init__(provider_def)
+
+        if self.gml_passthrough:
+            self._attach_gml_columns()
 
         self.link_templates = _normalize_link_config(provider_def.get("links"))
 
@@ -59,12 +105,46 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
     @property
     def fields(self) -> Dict:
-        fields = self.get_fields()
+        if self.property_shape == PROPERTY_SHAPE_FLAT_LEAF:
+            return {key.split(".")[-1]: value for key, value in self._fields.items()}
 
-        if self.flatten_properties:
-            return {key.split(".")[-1]: value for key, value in fields.items()}
+        if self.property_shape == PROPERTY_SHAPE_DOTTED:
+            return dict(self._fields)
 
-        return fields
+        result: Dict = {}
+
+        for key, value in self._fields.items():
+            parts = key.split(".")
+
+            if len(parts) == 1:
+                result[key] = value
+                continue
+
+            current = result
+
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {"type": "object", "properties": {}}
+                current = current[part]["properties"]
+
+            current[parts[-1]] = {k: v for k,
+                                  v in value.items() if v is not None}
+
+        return result
+
+    @property
+    def synthetic_property_keys(self) -> Tuple[str, ...]:
+        """Property keys this provider injects for downstream formatters
+        rather than as user-facing data (e.g. ``_geometry_gml``).
+
+        They are always emitted at the top level of ``feature["properties"]``
+        (bypassing ``property_shape``) because an output formatter needs
+        them, but they are not part of the collection's queryable schema.
+        Format-aware callers — e.g. a vendored pygeoapi serving GeoJSON —
+        can read this to strip them from the JSON body while leaving the
+        formatter input intact. Empty unless ``gml_passthrough`` is set.
+        """
+        return self._synthetic_keys
 
     def get_fields(self) -> Dict:
         return self._get_cached_fields
@@ -112,7 +192,8 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         :returns: GeoJSON FeatureCollection
         """
-        if self.flatten_properties and properties:
+
+        if self.property_shape == PROPERTY_SHAPE_FLAT_LEAF and properties:
             properties = [
                 (self._unflatten_property_name(name), value)
                 for name, value in properties
@@ -207,7 +288,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         """
 
         with Session(self._engine) as session:
-            item = session.get(self.table_model, identifier)
+            item = session.get(self.table_model, identifier) # type: ignore
 
             if item is None:
                 msg = f"No such item: {self.id_field}={identifier}."
@@ -299,10 +380,13 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
             if key in item_dict:
                 properties[key] = item_dict[key]
 
-        if self.flatten_properties:
-            feature["properties"] = self._flatten_properties(properties)
-        else:
-            feature["properties"] = self._objectify_properties(properties)
+        feature["properties"] = self._shape_properties(properties)
+
+        # Synthetic GML keys are formatter-contract keys, not user data:
+        # they bypass property_shape and land verbatim at the top level.
+        for key in self._synthetic_keys:
+            if key in item_dict:
+                feature["properties"][key] = item_dict[key]
 
         self._add_provider_links(feature, feature_id, links_base)
 
@@ -335,8 +419,12 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
     def _get_properties(self, select_properties: List[str]) -> List[str]:
         keys = self._expand_property_prefixes(
-            select_properties) or self.get_fields().keys()
-        filtered = [key for key in keys if key not in self.excluded_properties]
+            select_properties) or self._fields.keys()
+        filtered = [
+            key
+            for key in keys
+            if key not in self.excluded_properties and key not in self._synthetic_keys
+        ]
 
         return filtered
 
@@ -345,7 +433,6 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         E.g. ["arealplanId"] -> ["arealplanId.kommunenummer", "arealplanId.planidentifikasjon", ...]
         """
-        print(names)
         if not names:
             return names
 
@@ -367,15 +454,16 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         return expanded
 
     def _select_properties_clause(self, select_properties, skip_geometry=False):
-        column_names = list(select_properties or self.get_fields().keys())
+        column_names = list(select_properties or self._fields.keys())
 
         if self.properties:
             column_names = self.properties
 
         column_names = self._expand_property_prefixes(column_names)
+        # Synthetic GML columns always load; the formatter contract needs them.
+        column_names = list(column_names) + list(self._synthetic_keys)
 
         if not skip_geometry:
-            column_names = list(column_names)
             column_names.append(self.geom)
 
         selected_columns = []
@@ -391,6 +479,21 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         return load_only(*selected_columns)
 
+    def _get_property_filters(self, properties):
+        # With include_extra_query_parameters, pygeoapi forwards any unknown
+        # query param as a property filter; reject names that are not mapped
+        # columns as 400 instead of letting getattr raise (HTTP 500).
+        if properties:
+            valid_names = {attr.key for attr in class_mapper(
+                self.table_model).attrs} # type: ignore
+            for name, _ in properties:
+                if name not in valid_names:
+                    raise ProviderInvalidQueryError(
+                        user_msg=f"unknown query parameter: {name}"
+                    )
+
+        return super()._get_property_filters(properties)
+
     def _unflatten_property_name(self, name: str) -> str:
         """Map a flattened property name back to its dot-notated column name."""
         if name in self.get_fields():
@@ -401,6 +504,15 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
                 return key
 
         return name
+
+    def _shape_properties(self, properties: Dict[str, Any]) -> Dict[str, Any]:
+        if self.property_shape == PROPERTY_SHAPE_FLAT_LEAF:
+            return self._flatten_properties(properties)
+
+        if self.property_shape == PROPERTY_SHAPE_DOTTED:
+            return dict(properties)
+
+        return self._objectify_properties(properties)
 
     def _flatten_properties(self, properties: Dict[str, Any]) -> Dict[str, Any]:
         return {key.split(".")[-1]: value for key, value in properties.items()}
@@ -486,6 +598,89 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         if link_candidates:
             _merge_links(feature, link_candidates, links_base)
+
+    def _attach_gml_columns(self) -> None:
+        """Attach server-rendered GML columns to the mapped model.
+
+        The expressions mirror gml-export's MV pipeline: single-component
+        Multi* geometries are unwrapped (SOSI XSDs reject Multi* property
+        wrappers) and ST_AsGML emits GML 3.2 with long CRS URNs. Geometries
+        are NOT validated; invalid source geoms serialize to invalid GML.
+        """
+        mapper = class_mapper(self.table_model) # type: ignore
+
+        if GEOMETRY_GML_KEY in mapper.attrs:
+            return
+
+        geom_col = getattr(self.table_model, self.geom)
+
+        if self.gml_unwrap_multi:
+            geom_expr = case(
+                (
+                    func.ST_NumGeometries(geom_col) == 1,
+                    func.ST_GeometryN(geom_col, 1),
+                ),
+                else_=geom_col,
+            )
+        else:
+            geom_expr = geom_col
+
+        mapper.add_property(
+            GEOMETRY_GML_KEY,
+            column_property(
+                func.ST_AsGML(3, geom_expr, self.gml_precision,
+                              self.gml_options)
+            ),
+        )
+
+        if not self.derived_point_passthrough:
+            return
+
+        # Start point for lines, passthrough for points (RpPåskrift).
+        point_expr = case(
+            (
+                func.ST_GeometryType(geom_col).in_(
+                    ("ST_LineString", "ST_MultiLineString")
+                ),
+                func.ST_PointN(geom_expr, 1),
+            ),
+            else_=geom_col,
+        )
+
+        mapper.add_property(
+            DERIVED_POINT_GML_KEY,
+            column_property(
+                func.ST_AsGML(3, point_expr, self.gml_precision,
+                              self.gml_options)
+            ),
+        )
+
+
+def _resolve_property_shape(
+    provider_def: Dict[str, Any]
+) -> str:
+    explicit = provider_def.get("property_shape")
+    flatten = provider_def.get("flatten_properties")
+
+    if explicit is not None:
+        if explicit not in PROPERTY_SHAPES:
+            raise ValueError(
+                f"property_shape must be one of {PROPERTY_SHAPES!r}, got {explicit!r}"
+            )
+
+        if flatten is not None:
+            _logger.warning(
+                "Both property_shape and flatten_properties are set; "
+                "property_shape=%r takes precedence.",
+                explicit,
+            )
+
+        return explicit
+
+    if flatten is None:
+        return PROPERTY_SHAPE_NESTED
+
+    return PROPERTY_SHAPE_FLAT_LEAF if flatten else PROPERTY_SHAPE_NESTED
 
 
 def _get_coordinate_transformation(

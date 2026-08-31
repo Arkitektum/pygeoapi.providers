@@ -144,7 +144,7 @@ class MVTPostgreSQLProvider(MVTPostgreSQLProviderBase):
         return "String"
 
     def _get_cache_key(self) -> str:
-        return f"{self.db_name}/{self.db_search_path[0]}/{self.table}"
+        return f"{self.db_name}/{self.db_search_path[0]}/{self.table}" # type: ignore
 
 
 @cached(
