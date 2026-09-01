@@ -379,7 +379,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         for key in keys:
             if key in item_dict:
                 properties[key] = item_dict[key]
-
+        print(properties)
         feature["properties"] = self._shape_properties(properties)
 
         # Synthetic GML keys are formatter-contract keys, not user data:
@@ -506,6 +506,8 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         return name
 
     def _shape_properties(self, properties: Dict[str, Any]) -> Dict[str, Any]:
+        print(self.property_shape)
+        
         if self.property_shape == PROPERTY_SHAPE_FLAT_LEAF:
             return self._flatten_properties(properties)
 
