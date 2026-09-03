@@ -1,20 +1,22 @@
 import json
+import os
 from copy import deepcopy
 import logging
 from typing import Dict, List, Tuple, Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from osgeo import ogr, osr
-from sqlalchemy import select, func, Select, case
+from sqlalchemy import case, select
 from sqlalchemy.orm import Session, class_mapper, column_property, load_only
+from sqlalchemy.sql import func
 from geoalchemy2 import WKBElement
 from geoalchemy2.functions import ST_Intersects, ST_MakeEnvelope, ST_Transform
 from cachetools import cached, TTLCache, keys
 from functools import cached_property
 from pygeoapi.provider.base import (
     ProviderInvalidQueryError,
-    ProviderItemNotFoundError
+    ProviderItemNotFoundError,
 )
-from pygeoapi.provider.sql import PostgreSQLProvider as PostgreSQLProviderBase
+from pygeoapi.provider.sql import PostgreSQLProvider as  PostgreSQLProviderBase
 from pygeoapi.crs import CrsTransformSpec, get_crs, transform_bbox, DEFAULT_STORAGE_CRS
 from .schema import json_schema_to_fields, json_schema_to_collection_schema
 
@@ -22,7 +24,8 @@ ogr.UseExceptions()
 osr.UseExceptions()
 
 _sessions_cache = TTLCache(maxsize=640 * 1024, ttl=86400)
-
+_count_cache = TTLCache(maxsize=10240, ttl=86400)
+_signal_mtime: float = 0.0
 _logger = logging.getLogger(__name__)
 
 DEFAULT_CRS = "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
@@ -30,7 +33,6 @@ DEFAULT_CRS = "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
 PROPERTY_SHAPE_NESTED = "nested"
 PROPERTY_SHAPE_FLAT_LEAF = "flat_leaf"
 PROPERTY_SHAPE_DOTTED = "dotted"
-
 PROPERTY_SHAPES = (
     PROPERTY_SHAPE_NESTED,
     PROPERTY_SHAPE_FLAT_LEAF,
@@ -48,7 +50,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
       * Supports field mappings for richer JSON schema
       * Caches table IDs for faster creation of fields for previous and next items
       * Improved performance when querying large tables
-      * Converts dot-concatenated fields to objects (or flattens with underscores)
+      * Selectable property shape (dotted | nested | flat_leaf)
       * Fixes a bug related to BBOX filtering
     """
 
@@ -62,9 +64,11 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
             "exclude_properties", [])
 
         self.property_shape: str = _resolve_property_shape(provider_def)
+        # Retained for any external callers reading the legacy attribute.
+        self.flatten_properties: bool = self.property_shape == PROPERTY_SHAPE_FLAT_LEAF
 
-        self.flatten_properties: bool = provider_def.get(
-            "flatten_properties", False)
+        self.cache_signal_path: str | None = provider_def.get(
+            "cache_signal_path")
 
         self.gml_passthrough: bool = provider_def.get("gml_passthrough", False)
         self.derived_point_passthrough: bool = provider_def.get(
@@ -108,29 +112,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         if self.property_shape == PROPERTY_SHAPE_FLAT_LEAF:
             return {key.split(".")[-1]: value for key, value in self._fields.items()}
 
-        if self.property_shape == PROPERTY_SHAPE_DOTTED:
-            return dict(self._fields)
-
-        result: Dict = {}
-
-        for key, value in self._fields.items():
-            parts = key.split(".")
-
-            if len(parts) == 1:
-                result[key] = value
-                continue
-
-            current = result
-
-            for part in parts[:-1]:
-                if part not in current:
-                    current[part] = {"type": "object", "properties": {}}
-                current = current[part]["properties"]
-
-            current[parts[-1]] = {k: v for k,
-                                  v in value.items() if v is not None}
-
-        return result
+        return dict(self._fields)
 
     @property
     def synthetic_property_keys(self) -> Tuple[str, ...]:
@@ -146,13 +128,24 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         """
         return self._synthetic_keys
 
+    @cached_property
+    def get_cached_fields(self) -> Dict:
+        if self.schema:
+            fields = json_schema_to_fields(self.schema)
+
+            if fields:
+                self._fields = fields
+                return self._fields
+
+        return super().get_fields()
+
     def get_fields(self) -> Dict:
-        return self._get_cached_fields
+        return self.get_cached_fields
 
     def get_collection_schema(self) -> Dict | None:
         if self.schema:
             return json_schema_to_collection_schema(
-                self.schema, self.id_field, self.time_field, flatten=self.flatten_properties)
+                self.schema, self.property_shape, self.id_field, self.time_field)
 
         return None
 
@@ -192,6 +185,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         :returns: GeoJSON FeatureCollection
         """
+        self._check_cache_signal()
 
         if self.property_shape == PROPERTY_SHAPE_FLAT_LEAF and properties:
             properties = [
@@ -211,21 +205,17 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         links_base = _determine_links_base_url(kwargs, self.links_base_url)
 
         with Session(self._engine) as session:
-            id_column = getattr(self.table_model, self.id_field)
-
-            stmt = (
-                select(id_column.label("id"))
-                .filter(property_filters)
-                .filter(cql_filters)
-                .filter(bbox_filter)
-                .filter(time_filter)
-            )
-
             results = None
 
             if resulttype != "hits":
+                id_column = getattr(self.table_model, self.id_field)
+
                 ids_cte = (
-                    stmt
+                    select(id_column.label("id"))
+                    .filter(property_filters)
+                    .filter(cql_filters)
+                    .filter(bbox_filter)
+                    .filter(time_filter)
                     .order_by(id_column)
                     .offset(offset)
                     .limit(limit)
@@ -240,8 +230,20 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
             response: Dict[str, Any] = {"type": "FeatureCollection"}
             response["features"] = []
-            response["numberMatched"] = self._get_count(stmt, session)
             response["numberReturned"] = 0
+            response["numberMatched"] = _get_matched_count(
+                self.table,
+                tuple(properties),
+                tuple(bbox or ()),
+                datetime_,
+                filterq,
+                session,
+                getattr(self.table_model, self.id_field),
+                property_filters,
+                cql_filters,
+                bbox_filter,
+                time_filter,
+            )
 
             if resulttype == "hits" or not results:
                 return response
@@ -286,6 +288,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         :returns: GeoJSON FeatureCollection
         """
+        self._check_cache_signal()
 
         with Session(self._engine) as session:
             item = session.get(self.table_model, identifier) # type: ignore
@@ -317,23 +320,12 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
                 dropping_keys = deepcopy(props).keys()
 
                 for item in dropping_keys:
-                    if item not in self.properties:
+                    if item not in self.properties and item not in self._synthetic_keys:
                         props.pop(item)
 
             self._set_prev_and_next(identifier, feature, session)
 
         return feature
-
-    @cached_property
-    def _get_cached_fields(self) -> Dict:
-        if self.schema:
-            fields = json_schema_to_fields(self.schema)
-
-            if fields:
-                self._fields = fields
-                return self._fields
-
-        return super().get_fields()
 
     def _create_feature(
         self,
@@ -393,17 +385,6 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
         return feature
 
-    def _get_count(self, stmt: Select, session: Session) -> int | None:
-        count_stmt = (
-            stmt.with_only_columns(
-                func.count(), maintain_column_froms=True)
-            .order_by(None)
-            .limit(None)
-            .offset(None)
-        )
-
-        return session.scalar(count_stmt)
-
     def _get_bbox_filter(self, bbox: List[float]):
         if not bbox:
             return True
@@ -440,12 +421,12 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         expanded: List[str] = []
 
         for name in names:
-            if name in self.get_fields():
+            if name in self._fields:
                 expanded.append(name)
                 continue
 
             children = [
-                key for key in self.get_fields() if key.startswith(f"{name}.")]
+                key for key in self._fields if key.startswith(f"{name}.")]
 
             if children:
                 expanded.extend(children)
@@ -497,10 +478,10 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
 
     def _unflatten_property_name(self, name: str) -> str:
         """Map a flattened property name back to its dot-notated column name."""
-        if name in self.get_fields():
+        if name in self._fields:
             return name
 
-        for key in self.get_fields():
+        for key in self._fields:
             if key.split(".")[-1] == name:
                 return key
 
@@ -600,6 +581,13 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         if link_candidates:
             _merge_links(feature, link_candidates, links_base)
 
+    def _get_collection_namespace(self) -> str:
+        return f"{self.db_name}.{self.db_search_path[0]}.{self.table}" # type: ignore
+
+    def _check_cache_signal(self) -> None:
+        if self.cache_signal_path:
+            _maybe_invalidate_from_signal(self.cache_signal_path)
+
     def _attach_gml_columns(self) -> None:
         """Attach server-rendered GML columns to the mapped model.
 
@@ -657,9 +645,7 @@ class PostgreSQLProvider(PostgreSQLProviderBase):
         )
 
 
-def _resolve_property_shape(
-    provider_def: Dict[str, Any]
-) -> str:
+def _resolve_property_shape(provider_def: Dict[str, Any]) -> str:
     explicit = provider_def.get("property_shape")
     flatten = provider_def.get("flatten_properties")
 
@@ -731,6 +717,68 @@ def _get_table_ids(table_model, id_field, session: Session) -> List[Any]:
     ids = [str(r[0]) for r in result]
 
     return ids
+
+
+@cached(
+    cache=_count_cache,
+    # filterq is a pygeofilter AST (unhashable dataclasses) when a CQL filter
+    # is supplied; key on its repr, which is deterministic and field-complete.
+    key=lambda table, properties, bbox, datetime_, filterq, *_: keys.hashkey(
+        table,
+        properties,
+        bbox,
+        datetime_,
+        repr(filterq) if filterq is not None else None,
+    ),
+)
+def _get_matched_count(
+    table: str,
+    properties: Tuple,
+    bbox: Tuple,
+    datetime_: str | None,
+    filterq: str | None,
+    session: Session,
+    id_column: Any,
+    property_filters: Any,
+    cql_filters: Any,
+    bbox_filter: Any,
+    time_filter: Any,
+) -> int:
+    # Count the id column directly: no subquery wrap, and attached
+    # column_property expressions (ST_AsGML) never enter the statement.
+    return (
+        session.query(func.count(id_column))
+        .filter(property_filters)
+        .filter(cql_filters)
+        .filter(bbox_filter)
+        .filter(time_filter)
+        .scalar()
+    )
+
+
+def flush_count_cache() -> None:
+    """Invalidate cached numberMatched values (in-process only)."""
+    _count_cache.clear()
+
+
+def flush_caches() -> None:
+    """Invalidate both module-level TTL caches (in-process only)."""
+    _count_cache.clear()
+    _sessions_cache.clear()
+
+
+def _maybe_invalidate_from_signal(signal_path: str) -> None:
+    """Flush caches if signal_path's mtime is newer than the last seen."""
+    global _signal_mtime
+
+    try:
+        current = os.stat(signal_path).st_mtime
+    except FileNotFoundError:
+        return
+
+    if current > _signal_mtime:
+        _signal_mtime = current
+        flush_caches()
 
 
 def _find_identifier_index(ids: List[Any], identifier: str) -> int | None:

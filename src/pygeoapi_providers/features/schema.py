@@ -22,6 +22,8 @@ _GEOM_FORMATS = {
     "geometry": "geometry-any"
 }
 
+_NAMING_STRATEGIES = ("flat_leaf", "dotted")
+
 
 class Leaf(NamedTuple):
     path: Tuple[str, ...]
@@ -38,6 +40,29 @@ def json_schema_to_fields(
         return _create_fields(schema)
 
     return None
+
+
+def json_schema_to_collection_schema(
+    schema_uri: str,
+    naming: str,
+    id_field: str,
+    time_field: str | None,
+    geometry_field: str | None = "geometry",
+) -> Dict[str, Any] | None:
+    schema = _load_jsonschema(schema_uri)
+
+    if not schema:
+        return None
+
+    collection_schema = _create_collection_schema(
+        schema, id_field, time_field, geometry_field)
+
+    if naming == 'nested':
+        return collection_schema
+
+    transformed, _ = _transform_schema(collection_schema, naming)
+
+    return transformed
 
 
 def _create_fields(schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -79,29 +104,6 @@ def _create_fields(schema: Dict[str, Any]) -> Dict[str, Any]:
     return fields
 
 
-def json_schema_to_collection_schema(
-    schema_uri: str,
-    id_field: str,
-    time_field: str | None,
-    geometry_field: str | None = "geometry",
-    flatten: bool = False
-) -> Dict[str, Any] | None:
-    schema = _load_jsonschema(schema_uri)
-
-    if not schema:
-        return None
-
-    collection_schema = _create_collection_schema(
-        schema, id_field, time_field, geometry_field)
-
-    if not flatten:
-        return collection_schema
-
-    flattened, _ = _flatten_schema(collection_schema)
-
-    return flattened
-
-
 def _create_collection_schema(
     schema: Dict[str, Any],
     id_field: str,
@@ -140,16 +142,35 @@ def _create_collection_schema(
     return schema
 
 
-def _flatten_schema(
+def _transform_schema(
     schema: Dict[str, Any],
-    separator: str = "_"
+    naming: str,
+    separator: str | None = None
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Flatten nested objects in *schema*.
+
+    Args:
+        schema: the JSON Schema to flatten.
+        naming: ``"flat_leaf"`` hoists to the bare leaf name (``lokalId``) and only
+            falls back to a joined path when two leaves would collide.
+            ``"path"`` always uses the joined path
+            (``arealplanId.planidentifikasjon``), which is collision-free by
+            construction and keeps the provenance visible in the key.
+        separator: joins path segments. Defaults to ``"."`` for ``"path"``
+            naming and ``"_"`` for ``"leaf"`` naming.
+
+    Returns:
+        ``(flattened_schema, {flat_name: "original.dotted.path"})``
+    """
     if not is_flattenable(schema):
         raise ValueError(
             "Top-level schema must be an object with a 'properties' map")
 
+    if separator is None:
+        separator = "." if naming == "dotted" else "_"
+
     leaves = _collect_leaves(schema["properties"], schema.get("required", []))
-    names = _assign_names(leaves, separator=separator)
+    names = _assign_names(leaves, naming=naming, separator=separator)
 
     flat_properties: Dict[str, Any] = {}
     flat_required: List[str] = []
@@ -177,8 +198,9 @@ def _collect_leaves(
     properties: Dict[str, Any],
     required: List[str] | None = None,
     _path: Tuple[str, ...] = (),
-    _parent_required: bool = True
+    _parent_required: bool = True,
 ) -> List[Leaf]:
+    """Walk the schema depth-first and return every non-object property."""
     required = required or []
     leaves: List[Leaf] = []
 
@@ -203,17 +225,33 @@ def _collect_leaves(
 
 def _assign_names(
     leaves: List[Leaf],
+    naming: str,
     separator: str = "_"
 ) -> Dict[Tuple[str, ...], str]:
+    """Map each leaf path to a flat name.
+
+    ``naming="flat_leaf"``  -> ``lokalId``, prefixing only where leaf names clash.
+    ``naming="dotted"``  -> always the full joined path, e.g.
+                          ``arealplanId.planidentifikasjon`` when
+                          ``separator="."``.
+    """
+    if naming not in _NAMING_STRATEGIES:
+        raise ValueError(
+            f"naming must be one of {_NAMING_STRATEGIES}, got {naming!r}")
+
     counts = Counter(leaf.path[-1] for leaf in leaves)
     names: Dict[Tuple[str, ...], str] = {}
     used: Dict[str, int] = {}
 
     for leaf in leaves:
         leaf_name = leaf.path[-1]
-        name = leaf_name if counts[leaf_name] == 1 else separator.join(
-            leaf.path)
+        if naming == "dotted":
+            name = separator.join(leaf.path)
+        else:
+            name = leaf_name if counts[leaf_name] == 1 else separator.join(
+                leaf.path)
 
+        # Unlikely, but guarantee uniqueness even for pathological schemas.
         if name in used:
             used[name] += 1
             name = f"{name}{separator}{used[name]}"
